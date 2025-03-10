@@ -227,7 +227,7 @@ def train_anymae(config, train_dataset, val_dataset):
             if save_strategy == "epoch" and avg_val_loss < best_loss:
                 best_loss = avg_val_loss
                 torch.save(anymae.state_dict(), "best_model.pth")
-                mlflow.log_artifact("best_model.pth")
+                mlflow.log_artifact("models/best_model.pth")
 
     mlflow.end_run()
 
@@ -271,5 +271,6 @@ def main_dist(cfg: DictConfig):
 
 
 if __name__ == "__main__":
+    main()
 
 
