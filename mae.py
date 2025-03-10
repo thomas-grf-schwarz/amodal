@@ -1,5 +1,8 @@
 import torch
 from torch import nn
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 from transformers import (
     ViTMAEForPreTraining,
     ViTMAEConfig,
@@ -7,35 +10,10 @@ from transformers import (
     get_scheduler
     )
 import einops
-import collections
-import pickle
 from functools import partial
-from data import (
-    RAMDataset, 
-    TransformedDataset, 
-    transforms
-    )
-
-
-class PatchSize(collections.abc.Iterable):
-
-    def __init__(self, sizes):
-        self.sizes = sizes
-
-    def __getitem__(self, idx):
-        return self.sizes[idx]
-
-    def __pow__(self, power):
-        """
-        handle non-square images
-        """
-        product = 1
-        for size in self.sizes:
-            product *= size
-        return product
-
-    def __iter__(self):
-        return iter(self.sizes)
+from omegaconf import DictConfig
+import hydra
+from tqdm import tqdm
 
 
 class AnyMAEPatchifier(nn.Module):
@@ -115,13 +93,6 @@ class AnyMAEForDownstream(nn.Module):
         return self.head(out.last_hidden_state)
 
 
-def make_config(image_size: PatchSize, patch_size: PatchSize) -> ViTMAEConfig:
-    config = ViTMAEConfig()
-    config.image_size = image_size
-    config.patch_size = patch_size
-    return config
-
-
 def get_anymae(config: ViTMAEConfig) -> AnyMAE:
     vit = ViTMAEModel(config)
     patchifier = AnyMAEPatchifier(config)
@@ -129,68 +100,40 @@ def get_anymae(config: ViTMAEConfig) -> AnyMAE:
     return AnyMAE(vit, patchifier, unpatchifier, config)
 
 
-def make_config_emg() -> ViTMAEConfig:
-    config = make_config(image_size=PatchSize([8, 256]), patch_size=PatchSize([1, 32]))
-    config.num_channels = 1
-    config.num_hidden_layers = 5
-    config.num_attention_heads = 32
-    config.intermediate_size = 1024
-    config.hidden_size = 800
-    config.mask_ratio = 0.75
-    config.decoder_num_hidden_layers = 3
-    config.decoder_hidden_size = 512
-    config.decoder_intermediate_size = 1024
+def make_vitmae_config(cfg: OmegaConf) -> ViTMAEConfig:
+    
+    config = ViTMAEConfig()
 
-    config.mean = -0.0042
-    config.std = 0.0137
-    config.clip_at = 10
+    config.num_channels = cfg.num_channels  # e.g., 1
+    config.num_hidden_layers = cfg.num_hidden_layers  # e.g., 5
+    config.num_attention_heads = cfg.num_attention_heads  # e.g., 32
+    config.intermediate_size = cfg.intermediate_size  # e.g., 1024
+    config.hidden_size = cfg.hidden_size  # e.g., 800
+    config.mask_ratio = cfg.mask_ratio  # e.g., 0.75
+    config.decoder_num_hidden_layers = cfg.decoder_num_hidden_layers  # e.g., 3
+    config.decoder_hidden_size = cfg.decoder_hidden_size  # e.g., 512
+    config.decoder_intermediate_size = cfg.decoder_intermediate_size  # e.g., 1024
 
-    config.lr_multiplier = 2
+    config.mean = cfg.mean  # e.g., -0.0042
+    config.std = cfg.std  # e.g., 0.0137
+    config.clip_at = cfg.clip_at  # e.g., 10
+
+    config.lr_multiplier = cfg.lr_multiplier  # e.g., 2
 
     return config
 
-def get_emg_data():
-    config = make_config_emg()
-    transform_steps = [
-        lambda x: torch.from_numpy(x), 
-        lambda x: x[None, ...], 
-        lambda x: (x - mean) / torch.sqrt(var + 1e-6),
-        lambda x: torch.clip(x, -config.clip_at, config.clip_at),
-    ]
-    mean = torch.tensor(config.mean)
-    var = torch.tensor(config.std)
-    with open(config.train_tensor_dataset_path, "rb") as f:
-        train_dataset = RAMDataset(
-            TransformedDataset(
-                dataset=pickle.load(f), 
-                transform=partial(transforms, steps=transform_steps)
-                )
-            )
-    with open(config.train_tensor_dataset_path, "rb") as f:
-        val_dataset = RAMDataset(
-            TransformedDataset(
-                dataset=pickle.load(f), 
-                transform=partial(transforms, steps=transform_steps)
-                )
-            )
-    return train_dataset, val_dataset
 
-from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
-from torch.optim import AdamW
-from tqdm import tqdm
-
-def train_anymae(train_dataset, val_dataset):
+def train_anymae(config, train_dataset, val_dataset):
 
     config = make_config_emg()
     train_dataset, val_dataset = get_emg_data(config)
     anymae = get_anymae(config)
 
     # Configuration
-    batch_size = 32
+    batch_size = config.batch_size # 32
     base_learning_rate = config.lr_multiplier * 4 * 1.5e-4 * (batch_size / 256)
     weight_decay = 0.0 # 0.005
-    num_train_epochs = 800
+    num_train_epochs = config.epochs # 800
     warmup_ratio = 0.05
     logging_steps = 10
     save_strategy = "epoch"
@@ -207,8 +150,6 @@ def train_anymae(train_dataset, val_dataset):
     num_warmup_steps = warmup_ratio * num_training_steps
 
     inputs_overfit = None
-    # inputs_overfit, _ = next(iter(train_dataloader))
-    # inputs_overfit = inputs_overfit.to(device)
     train_losses = []
     val_losses = []
     learning_rates = []
@@ -302,5 +243,25 @@ def convert_model_to_int8_mixed_precision_trainable(model):
 
     return model
 
+
+@hydra.main(version_base=None, config_path="configs", config_name="mae")
+def main_dist(cfg: DictConfig):
+
+    get_data = hydra.utils.instantiate(cfg.get_data)
+    change_input_config = hydra.utils.instantiate(cfg.change_input_config)
+    
+    cfg = make_vitmae_config(cfg)
+    cfg = change_input_config(cfg)
+    train_dataset, val_dataset = get_data(cfg)
+    anymae = get_anymae(cfg)
+
+    if cfg.convert_model_to_int8_mixed_precision_trainable:
+        anymae = convert_model_to_int8_mixed_precision_trainable(anymae)
+
+    anymae = train_anymae(anymae, train_dataset, val_dataset)
+    import pdb; pdb.set_trace()
+
+
+if __name__ == "__main__":
 
 
