@@ -1,0 +1,31 @@
+# mae.yaml
+num_channels: 1
+num_hidden_layers: 5
+num_attention_heads: 32
+intermediate_size: 1024
+hidden_size: 800
+mask_ratio: 0.75
+
+decoder_num_hidden_layers: 3
+decoder_hidden_size: 512
+decoder_intermediate_size: 1024
+
+lr_multiplier: 2
+epochs: 800
+
+convert_model_to_int8_mixed_precision_trainable: false
+
+change_input_config:
+  _target_: emg.change_input_config_emg
+  image_size: [8, 256]
+  patch_size: [1, 32]
+
+get_data:
+  _target_: emg.get_data_emg
+  mean: -0.0042
+  var: 0.0137
+  clip_at: 10
+  train_tensor_dataset_path: ../data/val_tensor_dataset.pkl
+  val_tensor_dataset_path: ../data/val_tensor_dataset.pkl
+
+
