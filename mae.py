@@ -10,7 +10,7 @@ from transformers import (
     get_scheduler
     )
 import einops
-from functools import partial
+import mlflow
 from omegaconf import DictConfig
 import hydra
 from tqdm import tqdm
@@ -100,7 +100,7 @@ def get_anymae(config: ViTMAEConfig) -> AnyMAE:
     return AnyMAE(vit, patchifier, unpatchifier, config)
 
 
-def make_vitmae_config(cfg: OmegaConf) -> ViTMAEConfig:
+def make_vitmae_config(cfg: DictConfig) -> ViTMAEConfig:
     
     config = ViTMAEConfig()
 
@@ -114,27 +114,14 @@ def make_vitmae_config(cfg: OmegaConf) -> ViTMAEConfig:
     config.decoder_hidden_size = cfg.decoder_hidden_size  # e.g., 512
     config.decoder_intermediate_size = cfg.decoder_intermediate_size  # e.g., 1024
 
-    config.mean = cfg.mean  # e.g., -0.0042
-    config.std = cfg.std  # e.g., 0.0137
-    config.clip_at = cfg.clip_at  # e.g., 10
-
     config.lr_multiplier = cfg.lr_multiplier  # e.g., 2
+    config.batch_size = cfg.batch_size  # e.g., 32
+    config.epochs = cfg.epochs # e.g. 800
 
     return config
 
 
-import mlflow
-import torch
-from torch.optim import AdamW
-from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
-from transformers import get_scheduler
-from tqdm import tqdm
-
-def train_anymae(config, train_dataset, val_dataset):
-    config = make_config_emg()
-    train_dataset, val_dataset = get_emg_data(config)
-    anymae = get_anymae(config)
+def train_anymae(anymae, train_dataset, val_dataset, config):
 
     # Configuration
     batch_size = config.batch_size
@@ -149,9 +136,9 @@ def train_anymae(config, train_dataset, val_dataset):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_dataloader = DataLoader(
-        train_dataset, batch_size=batch_size, num_workers=2, shuffle=True)
+        train_dataset, batch_size=batch_size, num_workers=4, shuffle=True)
     val_dataloader = DataLoader(
-        val_dataset, batch_size=batch_size, num_workers=2, shuffle=False)
+        val_dataset, batch_size=batch_size, num_workers=4, shuffle=False)
 
     num_training_steps = num_train_epochs
     num_warmup_steps = warmup_ratio * num_training_steps
@@ -200,8 +187,9 @@ def train_anymae(config, train_dataset, val_dataset):
             progress_bar.set_postfix(loss=loss.item())
 
             # Log to MLflow
-            mlflow.log_metric("train_loss", loss.item(), step=epoch * len(train_dataloader) + step)
-            mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=epoch * len(train_dataloader) + step)
+            iteration = epoch * len(train_dataloader) + step
+            mlflow.log_metric("train_loss", loss.item(), step=iteration)
+            mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=iteration)
 
         # Scheduler step
         scheduler.step()
@@ -218,7 +206,7 @@ def train_anymae(config, train_dataset, val_dataset):
                         val_loss += outputs.loss.item()
 
             avg_val_loss = val_loss / len(val_dataloader)
-            print(f"Epoch {epoch+1}, Validation Loss: {avg_val_loss}")
+            # print(f"Epoch {epoch+1}, Validation Loss: {avg_val_loss}")
 
             # Log validation loss to MLflow
             mlflow.log_metric("val_loss", avg_val_loss, step=epoch)
@@ -226,11 +214,9 @@ def train_anymae(config, train_dataset, val_dataset):
             # Save best model
             if save_strategy == "epoch" and avg_val_loss < best_loss:
                 best_loss = avg_val_loss
-                torch.save(anymae.state_dict(), "best_model.pth")
-                mlflow.log_artifact("models/best_model.pth")
+                mlflow.log_artifact("best_model.pth")
 
     mlflow.end_run()
-
 
 
 def convert_model_to_int8_mixed_precision_trainable(model):
@@ -253,20 +239,21 @@ def convert_model_to_int8_mixed_precision_trainable(model):
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="mae")
-def main_dist(cfg: DictConfig):
+def main(cfg: DictConfig):
 
     get_data = hydra.utils.instantiate(cfg.get_data)
     change_input_config = hydra.utils.instantiate(cfg.change_input_config)
+    convert_model = hydra.utils.instantiate(cfg.convert_model)
     
     cfg = make_vitmae_config(cfg)
     cfg = change_input_config(cfg)
-    train_dataset, val_dataset = get_data(cfg)
+    train_dataset, val_dataset = get_data()
     anymae = get_anymae(cfg)
+    
+    if convert_model:
+        anymae = convert_model(anymae)
 
-    if cfg.convert_model_to_int8_mixed_precision_trainable:
-        anymae = convert_model_to_int8_mixed_precision_trainable(anymae)
-
-    anymae = train_anymae(anymae, train_dataset, val_dataset)
+    anymae = train_anymae(anymae, train_dataset, val_dataset, cfg)
     import pdb; pdb.set_trace()
 
 
