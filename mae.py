@@ -123,17 +123,24 @@ def make_vitmae_config(cfg: OmegaConf) -> ViTMAEConfig:
     return config
 
 
-def train_anymae(config, train_dataset, val_dataset):
+import mlflow
+import torch
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
+from transformers import get_scheduler
+from tqdm import tqdm
 
+def train_anymae(config, train_dataset, val_dataset):
     config = make_config_emg()
     train_dataset, val_dataset = get_emg_data(config)
     anymae = get_anymae(config)
 
     # Configuration
-    batch_size = config.batch_size # 32
+    batch_size = config.batch_size
     base_learning_rate = config.lr_multiplier * 4 * 1.5e-4 * (batch_size / 256)
-    weight_decay = 0.0 # 0.005
-    num_train_epochs = config.epochs # 800
+    weight_decay = 0.0
+    num_train_epochs = config.epochs
     warmup_ratio = 0.05
     logging_steps = 10
     save_strategy = "epoch"
@@ -149,11 +156,6 @@ def train_anymae(config, train_dataset, val_dataset):
     num_training_steps = num_train_epochs
     num_warmup_steps = warmup_ratio * num_training_steps
 
-    inputs_overfit = None
-    train_losses = []
-    val_losses = []
-    learning_rates = []
-
     # Optimizer
     optimizer = AdamW(anymae.parameters(), lr=base_learning_rate, weight_decay=weight_decay)
 
@@ -167,6 +169,16 @@ def train_anymae(config, train_dataset, val_dataset):
     anymae = anymae.to(device)
     best_loss = float("inf")
 
+    # Start MLflow experiment
+    mlflow.start_run()
+    mlflow.log_params({
+        "batch_size": batch_size,
+        "learning_rate": base_learning_rate,
+        "weight_decay": weight_decay,
+        "num_epochs": num_train_epochs,
+        "warmup_ratio": warmup_ratio
+    })
+
     for epoch in range(num_train_epochs):
         anymae.train()
         running_loss = 0.0
@@ -175,17 +187,11 @@ def train_anymae(config, train_dataset, val_dataset):
         for step, (inputs, labels) in enumerate(progress_bar):
             inputs, labels = inputs.to(device), labels.to(device)
 
-            # Forward pass under autocast for mixed precision
             optimizer.zero_grad()
             with autocast():
-                if inputs_overfit is not None:
-                    outputs = anymae(inputs_overfit)
-                else:
-                    outputs = anymae(inputs)
+                outputs = anymae(inputs)
+                loss = outputs.loss
 
-                loss = outputs.loss       
-
-            # Backward pass with GradScaler
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -193,36 +199,38 @@ def train_anymae(config, train_dataset, val_dataset):
             running_loss += loss.item()
             progress_bar.set_postfix(loss=loss.item())
 
-            # Log every `logging_steps`
-            if step % logging_steps == 0 and step != 0:
-                print(f"Step {step}, Loss: {loss.item()}")
-                train_losses.append(loss.item())
-            learning_rates.append(scheduler.get_last_lr())
+            # Log to MLflow
+            mlflow.log_metric("train_loss", loss.item(), step=epoch * len(train_dataloader) + step)
+            mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=epoch * len(train_dataloader) + step)
 
-        # Scheduler step (epoch-based cosine annealing)
+        # Scheduler step
         scheduler.step()
 
-        # Evaluation strategy (epoch-based)
+        # Validation
         if eval_strategy == "epoch":
             anymae.eval()
+            val_loss = 0.0
             with torch.no_grad():
-                val_loss = 0.0
                 for inputs, labels in val_dataloader:
                     inputs, labels = inputs.to(device), labels.to(device)
-
-                    # Validation forward pass under autocast
                     with autocast():
                         outputs = anymae(inputs)
                         val_loss += outputs.loss.item()
 
             avg_val_loss = val_loss / len(val_dataloader)
             print(f"Epoch {epoch+1}, Validation Loss: {avg_val_loss}")
-            val_losses.append(avg_val_loss)
+
+            # Log validation loss to MLflow
+            mlflow.log_metric("val_loss", avg_val_loss, step=epoch)
 
             # Save best model
             if save_strategy == "epoch" and avg_val_loss < best_loss:
                 best_loss = avg_val_loss
                 torch.save(anymae.state_dict(), "best_model.pth")
+                mlflow.log_artifact("best_model.pth")
+
+    mlflow.end_run()
+
 
 
 def convert_model_to_int8_mixed_precision_trainable(model):
