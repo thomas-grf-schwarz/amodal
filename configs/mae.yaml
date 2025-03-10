@@ -10,22 +10,27 @@ decoder_num_hidden_layers: 3
 decoder_hidden_size: 512
 decoder_intermediate_size: 1024
 
-lr_multiplier: 2
-epochs: 800
+lr_multiplier: 0.125
+epochs: 400
+batch_size: 256 # 32
 
-convert_model_to_int8_mixed_precision_trainable: false
+convert_model: null
+  # _target_: mae.convert_model_to_int8_mixed_precision_trainable
+  # _partial_: true
 
 change_input_config:
   _target_: emg.change_input_config_emg
+  _partial_: true
   image_size: [8, 256]
   patch_size: [1, 32]
 
 get_data:
   _target_: emg.get_data_emg
+  _partial_: true
   mean: -0.0042
   var: 0.0137
-  clip_at: 10
-  train_tensor_dataset_path: ../data/val_tensor_dataset.pkl
-  val_tensor_dataset_path: ../data/val_tensor_dataset.pkl
+  clip_at: 8
+  train_tensor_dataset_path: data/train_tensor_dataset.pkl
+  val_tensor_dataset_path: data/val_tensor_dataset.pkl
 
 

@@ -1,5 +1,6 @@
 import torch
 import pickle
+from functools import partial
 from data import *
 
 
@@ -14,10 +15,10 @@ def get_data_emg(
     mean = torch.tensor(mean)
     var = torch.tensor(var)
     transform_steps = [
-        lambda x: torch.from_numpy(x), 
         lambda x: x[None, ...], 
         lambda x: (x - torch.tensor(mean)) / torch.sqrt(var + 1e-6),
         lambda x: torch.clip(x, -clip_at, clip_at),
+        lambda x: x.squeeze(1),
     ]
     with open(train_tensor_dataset_path, "rb") as f:
         train_dataset = RAMDataset(
@@ -36,7 +37,7 @@ def get_data_emg(
     return train_dataset, val_dataset
 
 
-def change_input_config_emg(config):
-    config.image_size = PatchSize(cfg.image_size)
-    config.patch_size = PatchSize(cfg.patch_size)
+def change_input_config_emg(config, image_size, patch_size):
+    config.image_size = PatchSize(image_size)
+    config.patch_size = PatchSize(patch_size)
     return config
